@@ -1,0 +1,135 @@
+name: ragflow
+
+# RAGFlow v0.26.2 (slim) — memory-tuned for a 16 GB shared VPS.
+# Slim image is used on purpose: it ships WITHOUT bundled embedding models,
+# because embeddings + chat + rerank all come from your NVIDIA NIM endpoint.
+# That keeps local RAM/CPU load down.
+#
+# Service names (es01 / mysql / minio / redis) are FIXED — RAGFlow's internal
+# config template resolves those exact hostnames. Do not rename them.
+
+services:
+  es01:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.3
+    container_name: ragflow-es01
+    restart: unless-stopped
+    environment:
+      - node.name=es01
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - discovery.type=single-node
+      - bootstrap.memory_lock=false
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      # Heap is capped hard. 2 GB is plenty for a personal book corpus.
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g
+      # Relax disk watermarks so ES doesn't go read-only on a busy shared disk.
+      - cluster.routing.allocation.disk.watermark.low=3gb
+      - cluster.routing.allocation.disk.watermark.high=2gb
+      - cluster.routing.allocation.disk.watermark.flood_stage=1gb
+      - TZ=${TIMEZONE}
+    mem_limit: 4g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+
+  mysql:
+    image: mysql:8.0.39
+    container_name: ragflow-mysql
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=rag_flow
+      - TZ=${TIMEZONE}
+    command:
+      - --max_connections=1000
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+      - --binlog_expire_logs_seconds=604800
+    mem_limit: 1g
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-p${MYSQL_PASSWORD}"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2023-12-20T01-00-02Z
+    container_name: ragflow-minio
+    restart: unless-stopped
+    command: server --console-address ":9001" /data
+    environment:
+      - MINIO_ROOT_USER=${MINIO_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
+      - TZ=${TIMEZONE}
+    mem_limit: 512m
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9000/minio/health/live >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+
+  redis:
+    image: valkey/valkey:8
+    container_name: ragflow-redis
+    restart: unless-stopped
+    command: valkey-server --requirepass ${REDIS_PASSWORD} --maxmemory 256mb --maxmemory-policy allkeys-lru
+    mem_limit: 512m
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} ping | grep -q PONG"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+
+  ragflow:
+    image: infiniflow/ragflow:v0.26.2-slim
+    container_name: ragflow-server
+    restart: unless-stopped
+    depends_on:
+      es01:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      redis:
+        condition: service_started
+    environment:
+      - DOC_ENGINE=elasticsearch
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - SVR_HTTP_PORT=9380
+      - TZ=${TIMEZONE}
+      # Set to 0 after you've created your admin account to lock down signups.
+      - REGISTER_ENABLED=1
+    mem_limit: 5g
+    volumes:
+      - ragflow_logs:/ragflow/logs
+    # Coolify's proxy connects to this internal port. Do NOT publish to host.
+    expose:
+      - "80"
+
+volumes:
+  es_data:
+  mysql_data:
+  minio_data:
+  redis_data:
+  ragflow_logs:
