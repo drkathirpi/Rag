@@ -97,7 +97,7 @@ services:
       retries: 30
 
   ragflow:
-    image: infiniflow/ragflow:v0.26.2-slim
+    image: infiniflow/ragflow:v0.26.2
     container_name: ragflow-server
     restart: unless-stopped
     depends_on:
