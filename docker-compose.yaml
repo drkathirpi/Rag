@@ -125,7 +125,7 @@ services:
       - ragflow_logs:/ragflow/logs
     # Coolify's proxy connects to this internal port. Do NOT publish to host.
     expose:
-      - "80"
+      - "8081"
 
 volumes:
   es_data:
