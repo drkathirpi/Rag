@@ -1,135 +1,119 @@
-name: ragflow
-
-# RAGFlow v0.26.2 (slim) — memory-tuned for a 16 GB shared VPS.
-# Slim image is used on purpose: it ships WITHOUT bundled embedding models,
-# because embeddings + chat + rerank all come from your NVIDIA NIM endpoint.
-# That keeps local RAM/CPU load down.
-#
-# Service names (es01 / mysql / minio / redis) are FIXED — RAGFlow's internal
-# config template resolves those exact hostnames. Do not rename them.
-
 services:
-  es01:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.3
-    container_name: ragflow-es01
-    restart: unless-stopped
-    environment:
-      - node.name=es01
-      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-      - discovery.type=single-node
-      - bootstrap.memory_lock=false
-      - xpack.security.enabled=true
-      - xpack.security.http.ssl.enabled=false
-      - xpack.security.transport.ssl.enabled=false
-      # Heap is capped hard. 2 GB is plenty for a personal book corpus.
-      - ES_JAVA_OPTS=-Xms2g -Xmx2g
-      # Relax disk watermarks so ES doesn't go read-only on a busy shared disk.
-      - cluster.routing.allocation.disk.watermark.low=3gb
-      - cluster.routing.allocation.disk.watermark.high=2gb
-      - cluster.routing.allocation.disk.watermark.flood_stage=1gb
-      - TZ=${TIMEZONE}
-    mem_limit: 4g
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
+  trilium:
+    image: triliumnext/notes:latest
     volumes:
-      - es_data:/usr/share/elasticsearch/data
-    healthcheck:
-      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 40
-
-  mysql:
-    image: mysql:8.0.39
-    container_name: ragflow-mysql
-    restart: unless-stopped
-    environment:
-      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD}
-      - MYSQL_DATABASE=rag_flow
-      - TZ=${TIMEZONE}
-    command:
-      - --max_connections=1000
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
-      - --default-authentication-plugin=mysql_native_password
-      - --binlog_expire_logs_seconds=604800
-    mem_limit: 1g
-    volumes:
-      - mysql_data:/var/lib/mysql
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-uroot", "-p${MYSQL_PASSWORD}"]
-      interval: 15s
-      timeout: 10s
-      retries: 30
-
-  minio:
-    image: quay.io/minio/minio:RELEASE.2023-12-20T01-00-02Z
-    container_name: ragflow-minio
-    restart: unless-stopped
-    command: server --console-address ":9001" /data
-    environment:
-      - MINIO_ROOT_USER=${MINIO_USER}
-      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
-      - TZ=${TIMEZONE}
-    mem_limit: 512m
-    volumes:
-      - minio_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "curl -s http://localhost:9000/minio/health/live >/dev/null || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 30
-
-  redis:
-    image: valkey/valkey:8
-    container_name: ragflow-redis
-    restart: unless-stopped
-    command: valkey-server --requirepass ${REDIS_PASSWORD} --maxmemory 256mb --maxmemory-policy allkeys-lru
-    mem_limit: 512m
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} ping | grep -q PONG"]
-      interval: 15s
-      timeout: 10s
-      retries: 30
-
-  ragflow:
-    image: infiniflow/ragflow:v0.26.2
-    container_name: ragflow-server
-    restart: unless-stopped
-    depends_on:
-      es01:
-        condition: service_healthy
-      mysql:
-        condition: service_healthy
-      minio:
-        condition: service_started
-      redis:
-        condition: service_started
-    environment:
-      - DOC_ENGINE=elasticsearch
-      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
-      - MINIO_USER=${MINIO_USER}
-      - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-      - SVR_HTTP_PORT=9380
-      - TZ=${TIMEZONE}
-      # Set to 0 after you've created your admin account to lock down signups.
-      - REGISTER_ENABLED=1
-    mem_limit: 5g
-    volumes:
-      - ragflow_logs:/ragflow/logs
-    # Coolify's proxy connects to this internal port. Do NOT publish to host.
+      - trilium_data:/home/node/trilium-data
     expose:
-      - "8089"
+      - "8080"
+    restart: unless-stopped
+
+  classifier:
+    image: python:3.11-slim
+    depends_on:
+      - trilium
+    environment:
+      TRILIUM_URL: "http://trilium:8080"
+      TRILIUM_TOKEN: "PASTE_YOUR_ETAPI_TOKEN_HERE"
+      INBOX_NOTE_ID: "PASTE_YOUR_INBOX_NOTE_ID_HERE"
+      GEMINI_API_KEY: "PASTE_YOUR_GEMINI_KEY_HERE"
+      GEMINI_MODEL: "gemini-2.0-flash"
+      SUBSPECIALTIES: "Neonatology,Cardiology,Pulmonology,Nephrology,Gastroenterology,Neurology,Hematology-Oncology,Infectious Disease,Endocrinology,Genetics-Metabolic,Rheumatology-Immunology,Dermatology,ENT,Ophthalmology,Emergency-PICU,General Pediatrics"
+      POLL_INTERVAL_SECONDS: "300"
+    command:
+      - "sh"
+      - "-c"
+      - |
+        pip install --no-cache-dir requests --quiet
+        cat <<'PYEOF' > /app_main.py
+        import os, time, json, requests
+
+        TRILIUM_URL = os.environ["TRILIUM_URL"].rstrip("/")
+        TOKEN = os.environ["TRILIUM_TOKEN"]
+        INBOX_ID = os.environ["INBOX_NOTE_ID"]
+        GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+        GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+        SUBSPECIALTIES = [s.strip() for s in os.environ["SUBSPECIALTIES"].split(",")]
+        POLL = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
+
+        HEADERS = {"Authorization": TOKEN, "Content-Type": "application/json"}
+
+        def etapi_get(path, params=None):
+            r = requests.get(f"{TRILIUM_URL}/etapi{path}", headers=HEADERS, params=params, timeout=30)
+            r.raise_for_status()
+            return r.json()
+
+        def etapi_post(path, body):
+            r = requests.post(f"{TRILIUM_URL}/etapi{path}", headers=HEADERS, json=body, timeout=30)
+            r.raise_for_status()
+            return r.json()
+
+        def etapi_delete(path):
+            r = requests.delete(f"{TRILIUM_URL}/etapi{path}", headers=HEADERS, timeout=30)
+            return r.status_code
+
+        def get_note_content(note_id):
+            r = requests.get(f"{TRILIUM_URL}/etapi/notes/{note_id}/content", headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            return r.text
+
+        def ensure_notebook(title, parent_id):
+            found = etapi_get("/notes", params={"search": f'note.title = "{title}" and note.parents.noteId = "{parent_id}"'})
+            results = found.get("results", [])
+            if results:
+                return results[0]["noteId"]
+            created = etapi_post("/create-note", {
+                "parentNoteId": parent_id, "title": title, "type": "text", "content": f"<p>{title} notes</p>"
+            })
+            return created["note"]["noteId"]
+
+        def classify(text):
+            options = "\n".join(f"- {s}" for s in SUBSPECIALTIES)
+            prompt = (
+                "You are sorting a pediatric clinical note into exactly one subspecialty from this list:\n"
+                f"{options}\n\n"
+                "Return ONLY the exact matching label from the list, nothing else.\n\n"
+                f"Note:\n{text[:3000]}"
+            )
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+            resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=60)
+            resp.raise_for_status()
+            label = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            for s in SUBSPECIALTIES:
+                if s.lower() in label.lower():
+                    return s
+            return "General Pediatrics"
+
+        def move_note(note_id, old_parent_id, new_parent_id):
+            etapi_post("/branches", {"noteId": note_id, "parentNoteId": new_parent_id})
+            old_branch_id = f"{old_parent_id}_{note_id}"
+            etapi_delete(f"/branches/{old_branch_id}")
+
+        def main():
+            print("Setting up notebook structure...", flush=True)
+            diseases_root = ensure_notebook("Diseases", "root")
+            notebook_map = {s: ensure_notebook(s, diseases_root) for s in SUBSPECIALTIES}
+            print("Ready. Notebooks:", notebook_map, flush=True)
+
+            while True:
+                try:
+                    found = etapi_get("/notes", params={"search": f'note.parents.noteId = "{INBOX_ID}"'})
+                    for note in found.get("results", []):
+                        note_id = note["noteId"]
+                        title = note.get("title", "")
+                        content = get_note_content(note_id)
+                        text = f"{title}\n{content}"
+                        label = classify(text)
+                        target_id = notebook_map.get(label, notebook_map["General Pediatrics"])
+                        move_note(note_id, INBOX_ID, target_id)
+                        print(f"Moved '{title}' -> {label}", flush=True)
+                except Exception as e:
+                    print("Error in poll loop:", e, flush=True)
+                time.sleep(POLL)
+
+        if __name__ == "__main__":
+            main()
+        PYEOF
+        python /app_main.py
 
 volumes:
-  es_data:
-  mysql_data:
-  minio_data:
-  redis_data:
-  ragflow_logs:
+  trilium_data:
